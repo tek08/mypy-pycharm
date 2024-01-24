@@ -30,6 +30,7 @@ import com.leinardi.pycharm.mypy.util.Notifications;
 import javax.swing.AbstractAction;
 import javax.swing.Action;
 import javax.swing.JButton;
+import javax.swing.JCheckBox;
 import javax.swing.JPanel;
 import java.awt.event.ActionEvent;
 
@@ -39,6 +40,7 @@ public class MypyConfigPanel {
     private com.intellij.openapi.ui.TextFieldWithBrowseButton mypyPathField;
     private com.intellij.openapi.ui.TextFieldWithBrowseButton mypyConfigFilePathField;
     private JBTextField argumentsField;
+    private JCheckBox autodetectPipenvEnvironmentsCheckbox;
     private Project project;
 
     public MypyConfigPanel(Project project) {
@@ -48,6 +50,7 @@ public class MypyConfigPanel {
             throw new IllegalStateException("MypyConfigService is null");
         }
         testButton.setAction(new TestAction());
+        autodetectPipenvEnvironmentsCheckbox.setSelected(mypyConfigService.isAutodetectPipenvEnvironmentsEnabled());
         mypyPathField.setText(mypyConfigService.getCustomMypyPath());
         FileChooserDescriptor fileChooserDescriptor = new FileChooserDescriptor(
                 true, false, false, false, false, false);
@@ -90,6 +93,10 @@ public class MypyConfigPanel {
 
     public String getMypyArguments() {
         return argumentsField.getText();
+    }
+
+    public boolean isAutodetectPipenvEnvironmentsEnabled() {
+        return autodetectPipenvEnvironmentsCheckbox.isSelected();
     }
 
     @SuppressWarnings("unused")
