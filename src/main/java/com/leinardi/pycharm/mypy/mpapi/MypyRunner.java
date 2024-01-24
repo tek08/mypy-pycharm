@@ -256,19 +256,7 @@ public class MypyRunner {
             throw new MypyPluginException("Illegal state: mypyConfigService is null");
         }
 
-        // Necessary because of this: https://github.com/python/mypy/issues/4008#issuecomment-417862464
-        List<Issue> result = new ArrayList<>();
-        // TODO(tek): Remove these next couple lines as I don't think this bug happens anymore...
-        Set<String> filesToScanFiltered = new HashSet<>();
-        for (String filePath : filesToScan) {
-            if (filePath.endsWith("__init__.py") || filePath.endsWith("__main__.py") || filePath.endsWith("setup.py")) {
-                result.addAll(runMypy(project, Collections.singleton(filePath), mypyConfigService));
-            } else {
-                filesToScanFiltered.add(filePath);
-            }
-        }
-        result.addAll(runMypy(project, filesToScan, mypyConfigService));
-        return result;
+        return runMypy(project, filesToScan, mypyConfigService);
     }
 
     private static List<Issue> runMypy(Project project, Set<String> filesToScan, MypyConfigService mypyConfigService) throws InterruptedIOException, InterruptedException {
