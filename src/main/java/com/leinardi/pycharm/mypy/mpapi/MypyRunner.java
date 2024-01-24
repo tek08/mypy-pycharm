@@ -47,8 +47,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.InterruptedIOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -59,9 +60,26 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import java.nio.file.Path;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+
+class MypyConfigFileAndSetOfSourceFilePaths {
+    private final String mypyConfigFilePath;
+    private final Set<String> sourceFilePaths;
+
+    public MypyConfigFileAndSetOfSourceFilePaths(String mypyConfigFilePath, Set<String> sourceFilePaths) {
+        this.mypyConfigFilePath = mypyConfigFilePath;
+        this.sourceFilePaths = sourceFilePaths;
+    }
+
+    public String getMypyConfigFilePath() {
+        return mypyConfigFilePath;
+    }
+
+    public Set<String> getSourceFilePaths() {
+        return sourceFilePaths;
+    }
+}
 
 public class MypyRunner {
     public static final String MYPY_PACKAGE_NAME = "mypy";
@@ -85,7 +103,7 @@ public class MypyRunner {
         }
         VirtualFile mypyVirtualFile = LocalFileSystem.getInstance().findFileByPath(mypyPath);
         if (mypyVirtualFile == null || !mypyVirtualFile.exists() || mypyVirtualFile.isDirectory()) {
-            LOG.warn("Error while checking Mypy path " + mypyPath + ": null or not exists or not a file path");
+            LOG.warn("Error while checking Mypy path " + mypyPath + ": null or not exists or not a file path: " + mypyVirtualFile);
             return false;
         }
         GeneralCommandLine cmd = getMypyCommandLine(project, mypyPath);
@@ -239,29 +257,186 @@ public class MypyRunner {
             throw new MypyPluginException("Illegal state: mypyConfigService is null");
         }
 
-        String mypyPath = getMypyPath(project);
-        if (mypyPath.isEmpty()) {
-            throw new MypyToolException("Path to Mypy executable not set (check Plugin Settings)");
+        return runMypy(project, filesToScan, mypyConfigService);
+    }
+
+    private static List<Issue> runMypy(Project project, Set<String> filesToScan, MypyConfigService mypyConfigService) throws InterruptedIOException, InterruptedException {
+        if (filesToScan.isEmpty()) {
+            return new ArrayList<>();
         }
 
-        String mypyConfigFilePath = getMypyConfigFile(project, mypyConfigService.getMypyConfigFilePath());
+        // Keep track of which mypy executable we'll run, and on which source files (depending on which Pipenv they
+        // belong to).
+        Map<String, MypyConfigFileAndSetOfSourceFilePaths> mypyExecutablesMappedToConfigFileAndSourceFiles = new HashMap<>();
 
-        // Necessary because of this: https://github.com/python/mypy/issues/4008#issuecomment-417862464
-        List<Issue> result = new ArrayList<>();
-        Set<String> filesToScanFiltered = new HashSet<>();
-        for (String filePath : filesToScan) {
-            if (filePath.endsWith("__init__.py")
-                    || filePath.endsWith("__main__.py")
-                    || filePath.endsWith("setup.py")
-            ) {
-                result.addAll(runMypy(project, Collections.singleton(filePath), mypyPath, mypyConfigFilePath,
-                        mypyConfigService));
-            } else {
-                filesToScanFiltered.add(filePath);
+        // If we're Pipenv-hunting, we'll look in the Pipenv's venv directory for a mypy executable, but fallback is
+        // to use the project's mypy executable.
+        String projectMypyPath = getMypyPath(project);
+
+        // If we're Pipenv-hunting, we'll look in the Pipfile's directory for a mypy.ini, but fallback is to use the
+        // project's mypy.ini.
+        String projectMypyConfigFilePath = getMypyConfigFile(project, mypyConfigService.getMypyConfigFilePath());
+
+        if (!mypyConfigService.isAutodetectPipenvEnvironmentsEnabled()) {
+            if (projectMypyPath.isEmpty()) {
+                throw new MypyToolException("Path to Mypy executable not set (check Plugin Settings)");
             }
+
+            mypyExecutablesMappedToConfigFileAndSourceFiles.put(projectMypyPath,
+                    new MypyConfigFileAndSetOfSourceFilePaths(projectMypyConfigFilePath, filesToScan));
+        } else {
+            long startTime = System.nanoTime();
+
+            Map<String, String> sourceFilesParentDirectoryToMypyExecutableCache = new HashMap<>();
+
+            for (String sourceFilePath : filesToScan) {
+
+                // Because we're hopping around dirs, we need the _real_ path to sourceFile, not a temporary file ala
+                // "/var/folders/88/q_9ckxf93gs9qmdjgf0jkqjc0000gn/T/csi-009/project/..."
+                VirtualFile sourceFile = LocalFileSystem.getInstance().findFileByIoFile(new File(sourceFilePath));
+                if (sourceFile == null || !sourceFile.exists() || sourceFile.isDirectory()) {
+                    throw new MypyPluginException("Error while checking source file path " + sourceFilePath + ": " +
+                            "null or not exists or not a file path: " + sourceFile);
+                }
+
+                String sourceFileParentDirectory = sourceFile.getParent().getPath();
+
+                // Check the cache before we ask pipenv for the location of the virtualenv.
+                if (sourceFilesParentDirectoryToMypyExecutableCache.containsKey(sourceFileParentDirectory)) {
+                    String mypyPathToUse = sourceFilesParentDirectoryToMypyExecutableCache.get(sourceFileParentDirectory);
+
+                    mypyExecutablesMappedToConfigFileAndSourceFiles.computeIfAbsent(mypyPathToUse,
+                            k -> new MypyConfigFileAndSetOfSourceFilePaths(projectMypyConfigFilePath,
+                                    new HashSet<>())).getSourceFilePaths().add(sourceFilePath);
+                    continue;
+                }
+
+                // Otherwise, try to run `pipenv --venv` to get the location of the virtualenv
+                GeneralCommandLine pipenvVenvLocatingCommand = new GeneralCommandLine("pipenv");
+                pipenvVenvLocatingCommand.addParameter("--venv");
+                pipenvVenvLocatingCommand.setWorkDirectory(sourceFileParentDirectory);
+                // Pipenv has a normal max search depth of 3, so we need to increase it in case some directories are
+                // very nested.
+                pipenvVenvLocatingCommand.withEnvironment("PIPENV_MAX_DEPTH", "100");
+
+                GeneralCommandLine pipfileDirectoryLocatingCommand = new GeneralCommandLine("pipenv");
+                pipfileDirectoryLocatingCommand.addParameter("--where");
+                pipfileDirectoryLocatingCommand.setWorkDirectory(sourceFileParentDirectory);
+                pipfileDirectoryLocatingCommand.withEnvironment("PIPENV_MAX_DEPTH", "100");
+
+
+                try {
+                    final Process pipenvVenvLocatingProcess = pipenvVenvLocatingCommand.createProcess();
+                    pipenvVenvLocatingProcess.waitFor();
+
+                    final Process pipfileDirectoryLocatingProcess = pipfileDirectoryLocatingCommand.createProcess();
+                    pipfileDirectoryLocatingProcess.waitFor();
+
+                    String pipenvVenvLocatingError =
+                            new BufferedReader(new InputStreamReader(pipenvVenvLocatingProcess.getErrorStream(), UTF_8)).lines().collect(Collectors.joining("\n"));
+                    String pipenvVenvLocatingOutput =
+                            new BufferedReader(new InputStreamReader(pipenvVenvLocatingProcess.getInputStream(), UTF_8)).lines().collect(Collectors.joining("\n"));
+
+                    if (!StringUtil.isEmpty(pipenvVenvLocatingError)) {
+                        LOG.info("Pipenv Venv-locating Cmd: " + pipenvVenvLocatingCommand.getCommandLineString() + " in sourceFileParentDirectory " + sourceFileParentDirectory);
+                        LOG.warn("Error while locating Pipenv venv: " + pipenvVenvLocatingError);
+                    }
+                    if (!StringUtil.isEmpty(pipenvVenvLocatingOutput)) {
+                        LOG.info("Pipenv Venv-locating Output: " + pipenvVenvLocatingOutput);
+                    }
+
+                    String pipfileLocatingError =
+                            new BufferedReader(new InputStreamReader(pipfileDirectoryLocatingProcess.getErrorStream(), UTF_8)).lines().collect(Collectors.joining("\n"));
+                    String pipfileLocatingOutput =
+                            new BufferedReader(new InputStreamReader(pipfileDirectoryLocatingProcess.getInputStream(), UTF_8)).lines().collect(Collectors.joining("\n"));
+
+                    if (!StringUtil.isEmpty(pipfileLocatingError)) {
+                        LOG.info("Pipfile directory-locating cmd:: " + pipfileDirectoryLocatingCommand.getCommandLineString() + " in sourceFileParentDirectory " + sourceFileParentDirectory);
+                        LOG.warn("Error while locating Pipfile directory: " + pipfileLocatingError);
+                    }
+                    if (!StringUtil.isEmpty(pipfileLocatingOutput)) {
+                        LOG.info("Pipfile directory-locating output: " + pipfileLocatingOutput);
+                    }
+
+                    // If we can't find a pipenv, or the command fails for any reason, we'll fall back to the project's
+                    // mypy executable.
+                    String mypyPathToUseForThisDirectory = projectMypyPath;
+                    String mypyConfigFilePathToUseForThisDirectory = projectMypyConfigFilePath;
+
+                    if (pipenvVenvLocatingProcess.exitValue() == 0) {
+                        // Verify that the mypy actually exists in the Pipenv
+                        VirtualFile pipenvMypyExecutableFile = LocalFileSystem.getInstance().findFileByPath(
+                                String.join(File.separator, pipenvVenvLocatingOutput, "bin", MYPY_EXECUTABLE_NAME));
+
+                        if (pipenvMypyExecutableFile != null && pipenvMypyExecutableFile.exists() && !pipenvMypyExecutableFile.isDirectory()) {
+                            // If it does, use it instead of the project's mypy executable.
+                            mypyPathToUseForThisDirectory = pipenvMypyExecutableFile.getPath();
+
+                            // Cache the location of the pipenv bin folder for this source file, to save time for other
+                            // files in the same dir.
+                            sourceFilesParentDirectoryToMypyExecutableCache.put(sourceFileParentDirectory, mypyPathToUseForThisDirectory);
+                        }
+                    } else {
+                        // No big deal, we'll fall back to the project's mypy executable.
+                        LOG.info("Command Line string: " + pipenvVenvLocatingCommand.getCommandLineString());
+                        LOG.info("pipenv path check process.exitValue: " + pipenvVenvLocatingProcess.exitValue());
+                    }
+
+                    // If we can find a Pipfile, and a mypy.ini in the same directory, use that instead of the
+                    // project's mypy.ini.
+                    if (pipfileDirectoryLocatingProcess.exitValue() == 0) {
+                        VirtualFile mypyConfigFile = LocalFileSystem.getInstance().findFileByPath(
+                                pipfileLocatingOutput.trim() + File.separator + "mypy.ini");
+
+                        if (mypyConfigFile != null && mypyConfigFile.exists() && !mypyConfigFile.isDirectory()) {
+                            mypyConfigFilePathToUseForThisDirectory = mypyConfigFile.getPath();
+                        }
+                    } else {
+                        // No big deal, we'll fall back to the project's mypy.ini.
+                        LOG.info("Command Line string: " + pipfileDirectoryLocatingCommand.getCommandLineString());
+                        LOG.info("pipfile directory-locating process.exitValue: " + pipfileDirectoryLocatingProcess.exitValue());
+                    }
+
+                    final String finalMypyConfigFilePathForLambda = mypyConfigFilePathToUseForThisDirectory;
+                    mypyExecutablesMappedToConfigFileAndSourceFiles.computeIfAbsent(mypyPathToUseForThisDirectory,
+                            k -> new MypyConfigFileAndSetOfSourceFilePaths(finalMypyConfigFilePathForLambda,
+                                    new HashSet<>())).getSourceFilePaths().add(sourceFilePath);
+                } catch (ExecutionException | InterruptedException e) {
+                    LOG.info("Command Line string: " + pipenvVenvLocatingCommand.getCommandLineString());
+                    LOG.warn("Error while checking pipenv path", e);
+                    if (e instanceof InterruptedException) {
+                        throw (InterruptedException) e;
+                    }
+                    throw new MypyToolException("Error autodetecting Pipenv: ", e);
+                }
+            }
+
+            // Time taken by the process in nanoseconds
+            long pipenvDetectionRuntimeNanos = System.nanoTime() - startTime;
+            LOG.info("Mapping src files to Pipenvs took " + pipenvDetectionRuntimeNanos / 1000000 + "ms to " +
+                    "run for " + filesToScan.size() + " " + "files");
         }
-        result.addAll(runMypy(project, filesToScanFiltered, mypyPath, mypyConfigFilePath, mypyConfigService));
-        return result;
+
+        long startTime = System.nanoTime();
+
+        List<Issue> allIssues = new ArrayList<>();
+
+        for (Map.Entry<String, MypyConfigFileAndSetOfSourceFilePaths> entry : mypyExecutablesMappedToConfigFileAndSourceFiles.entrySet()) {
+            String mypyPath = entry.getKey();
+            Set<String> filesToScanForThisMypyExecutable = entry.getValue().getSourceFilePaths();
+            String mypyConfigFilePath = entry.getValue().getMypyConfigFilePath();
+
+            allIssues.addAll(runMypy(project, filesToScanForThisMypyExecutable, mypyPath, mypyConfigFilePath,
+                    mypyConfigService));
+        }
+
+        long mypyRuntimeNanos = System.nanoTime() - startTime;
+        LOG.info("Running Mypy" +
+                (mypyConfigService.isAutodetectPipenvEnvironmentsEnabled() ? " (w/ Pipenvs)" : "") +
+                " took " + mypyRuntimeNanos / 1000000 + "ms to run on " + filesToScan.size() + " files and found " +
+                allIssues.size() + " issues");
+
+        return allIssues;
     }
 
     private static List<Issue> runMypy(Project project, Set<String> filesToScan, String mypyPath,
@@ -302,12 +477,20 @@ public class MypyRunner {
 
         try {
             LOG.info("Running command: " + cmd.getCommandLineString());
+
+            long startTime = System.nanoTime();
+
             process = cmd.createProcess();
             InputStream inputStream = process.getInputStream();
             assert (inputStream != null);
 
             List<Issue> issues = parseMypyOutput(inputStream);
             process.waitFor();
+
+            long mypyExecutionDurationNanos = System.nanoTime() - startTime; // Time taken by the process in nanoseconds
+
+            LOG.info(mypyPath + " took " + mypyExecutionDurationNanos / 1000000 + "ms to run on " +
+                    filesToScan.size() + " files and found " + issues.size() + " issues");
 
             int exitCode = process.exitValue();
             if (exitCode != 0 && exitCode != 1) {

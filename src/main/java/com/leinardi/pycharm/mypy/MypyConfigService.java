@@ -31,6 +31,8 @@ public class MypyConfigService implements PersistentStateComponent<MypyConfigSer
     private String mypyArguments;
     private boolean scanBeforeCheckin;
 
+    private boolean isAutodetectPipenvEnvironmentsEnabled;
+
     public MypyConfigService() {
         customMypyPath = "";
         mypyArguments = "";
@@ -43,6 +45,14 @@ public class MypyConfigService implements PersistentStateComponent<MypyConfigSer
 
     public void setCustomMypyPath(String pathToMypy) {
         this.customMypyPath = pathToMypy;
+    }
+
+    public boolean isAutodetectPipenvEnvironmentsEnabled(){
+        return isAutodetectPipenvEnvironmentsEnabled;
+    }
+
+    public void setAutodetectPipenvEnvironmentsEnabled(boolean enabled){
+        this.isAutodetectPipenvEnvironmentsEnabled = enabled;
     }
 
     public String getMypyConfigFilePath() {
