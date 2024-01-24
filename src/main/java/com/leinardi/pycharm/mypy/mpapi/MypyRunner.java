@@ -48,6 +48,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.InterruptedIOException;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -102,7 +103,7 @@ public class MypyRunner {
         }
         VirtualFile mypyVirtualFile = LocalFileSystem.getInstance().findFileByPath(mypyPath);
         if (mypyVirtualFile == null || !mypyVirtualFile.exists() || mypyVirtualFile.isDirectory()) {
-            LOG.warn("Error while checking Mypy path " + mypyPath + ": null or not exists or not a file path");
+            LOG.warn("Error while checking Mypy path " + mypyPath + ": null or not exists or not a file path: " + mypyVirtualFile);
             return false;
         }
         GeneralCommandLine cmd = getMypyCommandLine(project, mypyPath);
@@ -290,9 +291,29 @@ public class MypyRunner {
 
             for (String sourceFilePath : filesToScan) {
 
-                VirtualFile sourceFile = LocalFileSystem.getInstance().findFileByPath(sourceFilePath);
+                // Because we're hopping around dirs, we need the _real_ path to sourceFile, not a temporary file ala
+                // "/var/folders/88/q_9ckxf93gs9qmdjgf0jkqjc0000gn/T/csi-009/project/..."
+
+                // TODO(tek): This doesn't seem to be working entirely correctly...
+                //   example:
+                /*
+                2024-01-24 14:22:55,071 [ 769368]   INFO - #com.leinardi.pycharm.mypy.mpapi.MypyRunner - Pipenv Venv-locating Cmd: pipenv --venv in sourceFileParentDirectory /private/var/folders/88/q_9ckxf93gs9qmdjgf0jkqjc0000gn/T/csi-007/pulumi_config/monitoring/alarms/cloud_run
+                2024-01-24 14:22:55,071 [ 769368]   WARN - #com.leinardi.pycharm.mypy.mpapi.MypyRunner - Error while locating Pipenv venv: No virtualenv has been created for this project/private/var/folders/88/q_9ckxf93gs9qmdjgf0jkqjc0000gn/T/csi-007/pulumi_config/monitoring/alarms/cloud_run yet!
+                 */
+
+                Path realPath;
+                try {
+                    Path path = Paths.get(sourceFilePath);
+                    realPath = path.toRealPath();
+                } catch (IOException e) {
+                    throw new MypyPluginException("Error while trying to resolve real path for source file path " +
+                            sourceFilePath + ": " + e.getMessage());
+                }
+
+                VirtualFile sourceFile = LocalFileSystem.getInstance().findFileByPath(realPath.toString());
                 if (sourceFile == null || !sourceFile.exists() || sourceFile.isDirectory()) {
-                    throw new MypyPluginException("Error while checking source file path " + sourceFilePath + ": null or not exists or not a file path");
+                    throw new MypyPluginException("Error while checking source file path " + sourceFilePath + ": " +
+                            "null or not exists or not a file path: " + sourceFile);
                 }
 
                 String sourceFileParentDirectory = sourceFile.getParent().getPath();
